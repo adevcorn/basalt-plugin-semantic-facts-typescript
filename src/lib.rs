@@ -1,8 +1,14 @@
-//! Semantic-facts-typescript — Parser-derived semantic facts for TypeScript/TSX.
+//! Semantic-facts-typescript — Parser-derived semantic facts for the
+//! ECMAScript family (TypeScript, TSX, JavaScript, JSX).
 //!
 //! Provides `semantic-facts@ts/v1` by consuming parser capabilities:
-//! - `parse.call-sites@ts/v1`
-//! - `parse.retrieval@ts/v1`
+//! - `parse.call-sites@{ts|tsx}/v1`
+//! - `parse.retrieval@{ts|tsx}/v1`
+//!
+//! The grammar domain is selected from the request path: `.ts/.mts/.cts` use
+//! the TypeScript grammar, while `.tsx/.js/.jsx/.mjs/.cjs` use TSX so JSX is
+//! recovered. If the host does not export the TSX capabilities (older core),
+//! the plugin retries the TypeScript capabilities.
 //!
 //! ## Future nice-to-haves
 //! - Optional `parse.type-refs@ts/v1` for import/type-import cross-package edges
@@ -30,7 +36,7 @@ basalt_plugin_meta! {
     provides:          "semantic-facts@ts/v1",
     requires:          "parse.call-sites@ts/v1\nparse.retrieval@ts/v1",
     optional_requires: "",
-    file_globs:        "**/*.ts\n**/*.tsx\n**/*.mts\n**/*.cts",
+    file_globs:        "**/*.ts\n**/*.tsx\n**/*.mts\n**/*.cts\n**/*.js\n**/*.jsx\n**/*.mjs\n**/*.cjs",
     activates_on:      "",
     activation_events: "",
 }
@@ -54,17 +60,45 @@ pub extern "C" fn basalt_capability_handle(
     let src = &request[4..4 + src_len];
     if src.is_empty() { return pack_empty(); }
 
-    match derive_semantic_facts(src) {
+    // Request layout: [src_len][src][path_len][path][root_len][root].
+    let mut domain = "ts";
+    let mut pos = 4 + src_len;
+    if request.len() >= pos + 4 {
+        let path_len =
+            u32::from_le_bytes([request[pos], request[pos + 1], request[pos + 2], request[pos + 3]])
+                as usize;
+        pos += 4;
+        if request.len() >= pos + path_len {
+            if let Ok(path) = core::str::from_utf8(&request[pos..pos + path_len]) {
+                domain = domain_for_path(path);
+            }
+        }
+    }
+
+    match derive_semantic_facts(src, domain) {
         Ok(facts) => pack_success(facts),
         Err(code) => pack_error(code),
     }
 }
 
+/// Pick the parser grammar domain for a workspace-relative path.
+fn domain_for_path(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    if ["tsx", "js", "jsx", "mjs", "cjs"]
+        .iter()
+        .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+    {
+        "tsx"
+    } else {
+        "ts"
+    }
+}
+
 // ── Semantic fact derivation ───────────────────────────────────────────────
 
-fn derive_semantic_facts(src: &[u8]) -> Result<Vec<u8>, i64> {
-    let call_sites_raw = invoke_parse_call_sites(src).map_err(|_| -1003)?;
-    let retrieval_raw  = invoke_parse_retrieval(src).map_err(|_| -1003)?;
+fn derive_semantic_facts(src: &[u8], domain: &str) -> Result<Vec<u8>, i64> {
+    let call_sites_raw = invoke_parse_call_sites(src, domain).map_err(|_| -1003)?;
+    let retrieval_raw  = invoke_parse_retrieval(src, domain).map_err(|_| -1003)?;
 
     let call_sites = decode_call_sites(&call_sites_raw);
     let retrieval  = decode_retrieval(&retrieval_raw);
@@ -79,20 +113,36 @@ fn derive_semantic_facts(src: &[u8]) -> Result<Vec<u8>, i64> {
 
 // ── Parser capability invocations ──────────────────────────────────────────
 
-fn invoke_parse_call_sites(src: &[u8]) -> Result<Vec<u8>, i64> {
-    let mut request = Vec::with_capacity(4 + src.len() + 4);
-    request.extend_from_slice(&(src.len() as u32).to_le_bytes());
-    request.extend_from_slice(src);
-    request.extend_from_slice(&16384u32.to_le_bytes());
-    invoke_capability("parse.call-sites@ts/v1", &request).map_err(|_| -1003)
+fn invoke_parse_call_sites(src: &[u8], domain: &str) -> Result<Vec<u8>, i64> {
+    invoke_parse_capability("parse.call-sites", src, 16384, domain)
 }
 
-fn invoke_parse_retrieval(src: &[u8]) -> Result<Vec<u8>, i64> {
+fn invoke_parse_retrieval(src: &[u8], domain: &str) -> Result<Vec<u8>, i64> {
+    invoke_parse_capability("parse.retrieval", src, 8192, domain)
+}
+
+/// Invoke a parser capability for `domain`, falling back to the TypeScript
+/// domain when the host has not registered the dialect capability yet.
+fn invoke_parse_capability(
+    capability: &str,
+    src: &[u8],
+    max_items: u32,
+    domain: &str,
+) -> Result<Vec<u8>, i64> {
     let mut request = Vec::with_capacity(4 + src.len() + 4);
     request.extend_from_slice(&(src.len() as u32).to_le_bytes());
     request.extend_from_slice(src);
-    request.extend_from_slice(&8192u32.to_le_bytes());
-    invoke_capability("parse.retrieval@ts/v1", &request).map_err(|_| -1003)
+    request.extend_from_slice(&max_items.to_le_bytes());
+
+    let primary = alloc::format!("{capability}@{domain}/v1");
+    match invoke_capability(&primary, &request) {
+        Ok(bytes) => Ok(bytes),
+        Err(_) if domain != "ts" => {
+            let fallback = alloc::format!("{capability}@ts/v1");
+            invoke_capability(&fallback, &request).map_err(|_| -1003)
+        }
+        Err(_) => Err(-1003),
+    }
 }
 
 // ── Parser response decoding ───────────────────────────────────────────────

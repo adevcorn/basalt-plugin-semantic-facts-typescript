@@ -1,9 +1,17 @@
 # basalt-plugin-semantic-facts-typescript
 
-Semantic facts provider for TypeScript/TSX.
+Semantic facts provider for the ECMAScript family: TypeScript, TSX,
+JavaScript, and JSX.
 
 Consumes parser-derived information to provide high-level semantic facts
 such as Call Hierarchy, Symbol Declarations, Import edges, and Async boundaries.
+
+The grammar domain is selected from the request path:
+- `.ts`, `.mts`, `.cts` → `parse.*@ts/v1`
+- `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs` → `parse.*@tsx/v1`
+
+If the host does not register the TSX capabilities (older core), the plugin
+retries the TypeScript domain.
 
 ## Provides
 - `semantic-facts@ts/v1`
